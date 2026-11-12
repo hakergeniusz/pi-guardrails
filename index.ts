@@ -63,6 +63,8 @@ type GuardrailsConfig = {
 	maxChars: number;
 	/** Identical actions within this window reuse the previous verdict. */
 	cacheTtlMs: number;
+	/** Block verdicts below this confidence run anyway (allow) and are logged. 0 disables. */
+	minBlockConfidence: number;
 	/** Bash commands matching any of these skip the model (case-sensitive, first-match wins). */
 	alwaysAllow: string[];
 	/** Safety valve: actions matching any of these are never blocked. */
@@ -85,6 +87,7 @@ const DEFAULTS: GuardrailsConfig = {
 	log: true,
 	maxChars: 6000,
 	cacheTtlMs: 5 * 60 * 1000,
+	minBlockConfidence: 0.6,
 	// Strictly read-only, no network, no writes. Anything not listed here
 	// (including compound commands with &&) goes to the decision model.
 	alwaysAllow: [
@@ -130,7 +133,7 @@ type LogEntry = {
 	tool: string;
 	model: string;
 	path: "classifier" | "chat";
-	mode: "model" | "fastpath" | "cache" | "failopen" | "failclosed" | "neverblock" | "error";
+	mode: "model" | "fastpath" | "cache" | "failopen" | "failclosed" | "neverblock" | "lowconf" | "error";
 	verdict: "allow" | "block";
 	category: string;
 	reason: string;
@@ -151,6 +154,8 @@ function loadConfig(): GuardrailsConfig {
 		if (typeof raw.log === "boolean") cfg.log = raw.log;
 		if (typeof raw.maxChars === "number" && raw.maxChars > 0) cfg.maxChars = raw.maxChars;
 		if (typeof raw.cacheTtlMs === "number" && raw.cacheTtlMs >= 0) cfg.cacheTtlMs = raw.cacheTtlMs;
+		if (typeof raw.minBlockConfidence === "number" && raw.minBlockConfidence >= 0 && raw.minBlockConfidence <= 1)
+			cfg.minBlockConfidence = raw.minBlockConfidence;
 		if (Array.isArray(raw.alwaysAllow)) cfg.alwaysAllow = raw.alwaysAllow.map(String);
 		if (Array.isArray(raw.neverBlock)) cfg.neverBlock = raw.neverBlock.map(String);
 	} catch {
@@ -457,6 +462,17 @@ export default function (pi: ExtensionAPI): void {
 		if (result.mode === "failopen" && !notifiedFailover) {
 			notifiedFailover = true;
 			ctx.ui.notify?.("guardrails: no decision model answered — failing open (check ~/.pi/agent/guardrails-log.jsonl)", "warning");
+		}
+		// Calibrated classifiers allow applying a confidence floor: a block the
+		// model is not sure about runs anyway. This is the tunable against the
+		// over-sensitivity failure mode of the previous guard extension.
+		if (
+			result.verdict.decision === "block" &&
+			typeof result.verdict.confidence === "number" &&
+			result.verdict.confidence < config.minBlockConfidence
+		) {
+			result.verdict = { ...result.verdict, decision: "allow" };
+			result.mode = "lowconf";
 		}
 		cacheSet(cacheKey, { ...result.verdict, model: result.model });
 		log({

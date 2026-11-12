@@ -32,14 +32,17 @@ matched after stripping the prefix.
 
 Configured as pi model refs, tried in order; the first usable answer wins.
 
-- **classifier models** (pi model type `classifier` — SystemOne decision
-  models such as `openrouter/~liquid/d1-latest`, served at
-  `https://openrouter.ai/api/v1/systemone`) go through
-  `modelRegistry.classify()` with a choice question.
+- **classifier models** (pi model type `classifier`) go through
+  `modelRegistry.classify()` with a choice question. Local llama.cpp decision
+  models work through the `llama-cpp-classify` fallback (label-token
+  logprobs, e.g. `llama.cpp/d3-lite` served by llama-server) and SystemOne
+  services (`typesafe-system-one`, e.g. openrouter's `~liquid/d1-*` at
+  `/api/v1/systemone`) answer natively.
 - **chat models** (e.g. openrouter `:free`) go through
   `modelRegistry.complete()` with a strict JSON verdict protocol.
 
-Default: `openrouter/nvidia/nemotron-3.5-lightning:free`, then
+Default: `llama.cpp/d3-lite` (local Decision 3.0 Lite, ~100ms per verdict),
+then `openrouter/nvidia/nemotron-3.5-lightning:free`, then
 `openrouter/nvidia/nemotron-3.5-super-vl:free`.
 
 ## Configuration
@@ -49,13 +52,14 @@ Default: `openrouter/nvidia/nemotron-3.5-lightning:free`, then
 ```json
 {
   "enabled": true,
-  "model": ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/nvidia/nemotron-3.5-super-vl:free"],
+  "model": ["llama.cpp/d3-lite", "openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/nvidia/nemotron-3.5-super-vl:free"],
   "scope": ["bash", "write", "edit"],
   "failMode": "open",
   "timeoutMs": 8000,
   "log": true,
   "maxChars": 6000,
   "cacheTtlMs": 300000,
+  "minBlockConfidence": 0.6,
   "alwaysAllow": ["^\\s*(ls|pwd|cat|rg|grep|fd|jq)\\b", "^\\s*git (status|log|diff|show|branch)\\b"],
   "neverBlock": []
 }
@@ -71,6 +75,7 @@ Default: `openrouter/nvidia/nemotron-3.5-lightning:free`, then
 | `log` | append decisions to the audit log |
 | `maxChars` | truncate the payload sent to the model |
 | `cacheTtlMs` | identical actions reuse their verdict for this long |
+| `minBlockConfidence` | block verdicts below this confidence run anyway (allow) and are logged; 0.6 default, 0 disables |
 | `alwaysAllow` | bash regexes that skip the model |
 | `neverBlock` | regexes (matched against the bare action) that can never be blocked |
 
