@@ -46,7 +46,7 @@ import type {
 	ToolCallEvent,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import type { ClassifierContext } from "@earendil-works/pi-ai";
+import type { ClassifierApi, ClassifierContext, ClassifierResult } from "@earendil-works/pi-ai";
 
 type GuardrailsConfig = {
 	enabled: boolean;
@@ -75,9 +75,20 @@ const AGENT_DIR = path.join(process.env.HOME ?? "~", ".pi", "agent");
 const CONFIG_PATH = path.join(AGENT_DIR, "guardrails.json");
 const LOG_PATH = path.join(AGENT_DIR, "guardrails-log.jsonl");
 
+/** Google AI Studio's Decisions API: the same verdict protocol as pi's
+ * `openai-decisions`, but with Google's wire shapes — questions and answers
+ * are maps (not arrays), yes/no is `noul` (not `predicate`), and auth is the
+ * `x-goog-api-key` header. pi 1.5.2 has no google-decisions classifier, so
+ * this extension registers one. gemini-decision-1 has a generous free quota
+ * and answers in ~150-250ms. */
+const GOOGLE_DECISIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const GOOGLE_DECISIONS_API: ClassifierApi = "google-decisions";
+
 const DEFAULTS: GuardrailsConfig = {
 	enabled: true,
 	model: [
+		"google-decisions/gemini-decision-1",
+		"llama.cpp/d3-lite",
 		"openrouter/nvidia/nemotron-3.5-lightning:free",
 		"openrouter/nvidia/nemotron-3.5-super-vl:free",
 	],
@@ -289,6 +300,82 @@ function shortModelRef(ref: string): string {
 	return slash >= 0 ? ref.slice(slash + 1) : ref;
 }
 
+/** pi-ai question → Google Decisions wire question (map values, `noul` for bools). */
+function googleWireQuestion(question: { type: string; instructions: string; criteria: unknown }): Record<string, unknown> {
+	if (question.type === "choice") {
+		return { type: "choice", instructions: question.instructions, criteria: question.criteria };
+	}
+	if (question.type === "bool") {
+		const criteria = question.criteria as { true?: string; false?: string } | undefined;
+		return {
+			type: "noul",
+			instructions: question.instructions,
+			criteria: { true_description: criteria?.true ?? "", false_description: criteria?.false ?? "" },
+		};
+	}
+	return { type: "score", instructions: question.instructions, criteria: question.criteria };
+}
+
+/** Classify through Google's Decisions API. Registered as the classifier
+ * implementation of the `google-decisions` provider below. */
+function googleDecisionsClassifier() {
+	return async (
+		model: { id: string; baseUrl?: string },
+		context: ClassifierContext,
+		options?: { apiKey?: string; signal?: AbortSignal },
+	): Promise<ClassifierResult> => {
+		const output: ClassifierResult = {
+			api: GOOGLE_DECISIONS_API,
+			provider: "google-decisions",
+			model: model.id,
+			answers: {},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		try {
+			const apiKey = options?.apiKey || process.env.GEMINI_API_KEY_1;
+			if (!apiKey) throw new Error("no Google API key (set GEMINI_API_KEY_1)");
+			const response = await fetch(`${(model.baseUrl ?? GOOGLE_DECISIONS_BASE_URL).replace(/\/+$/u, "")}/decisions`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+				body: JSON.stringify({
+					model: model.id,
+					input: JSON.stringify(context.state),
+					questions: Object.fromEntries(
+						Object.entries(context.questions).map(([id, question]) => [
+							id,
+							googleWireQuestion(question as { type: string; instructions: string; criteria: unknown }),
+						]),
+					),
+				}),
+				signal: options?.signal,
+			});
+			const body = (await response.json()) as {
+				answers?: Record<string, { type?: string; choice?: string; probabilities?: Record<string, number>; confidence?: number; noul?: number; score?: number }>;
+				error?: { message?: string };
+			};
+			if (!response.ok) throw new Error(body.error?.message ?? `Google Decisions API error ${response.status}`);
+			const answers: ClassifierResult["answers"] = {};
+			for (const [id, answer] of Object.entries(body.answers ?? {})) {
+				if (answer.type === "choice" && typeof answer.choice === "string") {
+					answers[id] = { type: "choice", choice: answer.choice, probabilities: answer.probabilities ?? {}, confidence: answer.confidence ?? 0 };
+				} else if (answer.type === "noul" && typeof answer.noul === "number") {
+					answers[id] = { type: "bool", probability: answer.noul };
+				} else if (answer.type === "score" && typeof answer.score === "number") {
+					answers[id] = { type: "score", score: answer.score, confidence: answer.confidence ?? 0 };
+				}
+			}
+			output.answers = answers;
+			return output;
+		} catch (error) {
+			output.answers = {};
+			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorMessage = String((error as Error)?.message ?? error).slice(0, 200);
+			return output;
+		}
+	};
+}
+
 function splitRef(ref: string): { provider: string; id: string } | null {
 	const slash = ref.indexOf("/");
 	if (slash <= 0 || slash === ref.length - 1) return null;
@@ -296,6 +383,28 @@ function splitRef(ref: string): { provider: string; id: string } | null {
 }
 
 export default function (pi: ExtensionAPI): void {
+	// Register the Google AI Studio Decisions API as a classifier provider so
+	// `google-decisions/gemini-decision-1` resolves through modelRegistry like
+	// any other decision model. Key: the multi-account `$GEMINI_API_KEY_1`
+	// env ref; the impl falls back to the process env directly.
+	pi.registerProvider("google-decisions", {
+		name: "Google Decisions",
+		baseUrl: GOOGLE_DECISIONS_BASE_URL,
+		apiKey: "$GEMINI_API_KEY_1",
+		models: [
+			{
+				type: "classifier",
+				id: "gemini-decision-1",
+				name: "Gemini Decision 1",
+				api: GOOGLE_DECISIONS_API,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 262144,
+			},
+		],
+		classifiers: { [GOOGLE_DECISIONS_API]: { classify: googleDecisionsClassifier() } },
+	});
+
 	let config = loadConfig();
 	let alwaysAllow: RegExp[] = compileRegexes(config.alwaysAllow);
 	let neverBlock: RegExp[] = compileRegexes(config.neverBlock);
