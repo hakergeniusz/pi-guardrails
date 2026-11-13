@@ -1,27 +1,27 @@
 {
-	"name": "pi-guardrails",
-	"version": "1.0.0",
-	"description": "Decision-model guardrails for pi's bash, write, and edit tools: allow-biased LLM verdicts, read-only fast-path, fail-open, audit log.",
-	"type": "module",
-	"license": "MIT",
-	"keywords": [
-		"pi",
-		"pi-package",
-		"guardrails",
-		"safety"
-	],
-	"main": "./index.ts",
-	"pi": {
-		"extensions": [
-			"./index.ts"
-		]
-	},
-	"engines": {
-		"node": ">=22.0.0"
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*"
-	},
-	"private": true
+ "name": "pi-guardrails",
+ "version": "1.1.0",
+ "description": "Decision-model guardrails for pi's bash, write, and edit tools: allow-biased LLM verdicts, read-only fast-path, fail-open, audit log.",
+ "type": "module",
+ "license": "MIT",
+ "keywords": [
+  "pi",
+  "pi-package",
+  "guardrails",
+  "safety"
+ ],
+ "main": "./index.ts",
+ "pi": {
+  "extensions": [
+   "./index.ts"
+  ]
+ },
+ "engines": {
+  "node": ">=22.0.0"
+ },
+ "peerDependencies": {
+  "@earendil-works/pi-ai": "*",
+  "@earendil-works/pi-coding-agent": "*"
+ },
+ "private": true
 }

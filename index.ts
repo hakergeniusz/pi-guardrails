@@ -317,9 +317,117 @@ function googleWireQuestion(question: { type: string; instructions: string; crit
 	return { type: "score", instructions: question.instructions, criteria: question.criteria };
 }
 
-/** Classify through Google's Decisions API. Registered as the classifier
- * implementation of the `google-decisions` provider below. */
-function googleDecisionsClassifier() {
+/* Google Decisions key ring. gemini-decision-1 quota is per project (one
+ * project per multi-account key), so a 429 — or a revoked key — should try
+ * the next key instead of failing the guard. Same classification scheme as
+ * the router: PerDay → dead until midnight Pacific, per-minute → cooling by
+ * the retry hint, ambiguous → suspected for 30 minutes, invalid key → dead
+ * until midnight. Marks are in-memory (they only matter within a session);
+ * labels are the key's last 4 chars — never the key itself. */
+
+const MULTI_ACCOUNT_PATH = path.join(AGENT_DIR, "multi-account.json");
+const DECISIONS_SUSPECTED_TTL_MS = 30 * 60 * 1000;
+const DECISIONS_MINUTE_MAX_MS = 120 * 1000;
+
+interface DecisionsKey {
+	value: string;
+	label: string;
+}
+
+/** label → dead-until epoch ms. */
+const decisionsMarks = new Map<string, number>();
+/** The key that last answered; tried first on the next call. */
+let decisionsSticky: string | undefined;
+
+function redactKey(value: string): string {
+	return value.length >= 8 ? `…${value.slice(-4)}` : "…";
+}
+
+/** Candidate keys: the pi-resolved key, the multi-account google accounts
+ * ($ENV refs resolved now), then a GEMINI_API_KEY_N env scan. Deduped. */
+function decisionsKeys(preferred: string | undefined): DecisionsKey[] {
+	const seen = new Set<string>();
+	const keys: DecisionsKey[] = [];
+	const push = (value: string | undefined): void => {
+		if (!value || seen.has(value)) return;
+		seen.add(value);
+		keys.push({ value, label: redactKey(value) });
+	};
+	push(preferred);
+	try {
+		const config = JSON.parse(fs.readFileSync(MULTI_ACCOUNT_PATH, "utf8")) as {
+			providers?: Record<string, { api?: string; accounts?: Array<{ apiKey?: string }> }>;
+		};
+		const google = config.providers?.google;
+		if (google?.api === "google-generative-ai" && Array.isArray(google.accounts)) {
+			for (const account of google.accounts) {
+				const ref = String(account.apiKey ?? "");
+				push(ref.startsWith("$") ? process.env[ref.slice(1)] : ref);
+			}
+		}
+	} catch {
+		// multi-account.json unreadable: the env scan still applies.
+	}
+	for (const name of Object.keys(process.env)
+		.filter((n) => /^GEMINI_API_KEY_\d+$/.test(n))
+		.sort((a, b) => Number(/(\d+)$/.exec(a)?.[1]) - Number(/(\d+)$/.exec(b)?.[1]))) {
+		push(process.env[name]);
+	}
+	return keys;
+}
+
+/** Wall-clock offset of America/Los_Angeles at the given epoch (ms). */
+function pacificOffsetMs(epochMs: number): number {
+	const dtf = new Intl.DateTimeFormat("en-US", {
+		timeZone: "America/Los_Angeles",
+		hourCycle: "h23",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+	});
+	const parts: Record<string, string> = {};
+	for (const p of dtf.formatToParts(new Date(epochMs))) parts[p.type] = p.value;
+	const asUTC = Date.UTC(
+		Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+		Number(parts.hour), Number(parts.minute), Number(parts.second),
+	);
+	return asUTC - Math.floor(epochMs / 1000) * 1000;
+}
+
+/** Epoch ms of the next 00:00 in America/Los_Angeles (free-tier RPD reset). */
+function nextPacificMidnight(epochMs: number): number {
+	const offset = pacificOffsetMs(epochMs);
+	const wall = epochMs + offset;
+	const nextDayWall = Math.floor(wall / 86400000) * 86400000 + 86400000;
+	return nextDayWall - offset;
+}
+
+/** Dead-until timestamp for a Decisions API failure, or undefined when the
+ * failure is not key-specific (network hiccups must not mark keys). */
+function decisionsDeadUntil(errorMessage: string): number | undefined {
+	const now = Date.now();
+	// A revoked key cannot answer until the user fixes it: out for the day.
+	if (/401|403|API[_ ]KEY[_ ]INVALID|API key not valid|PERMISSION_DENIED/i.test(errorMessage)) {
+		return nextPacificMidnight(now);
+	}
+	if (!/429|RESOURCE_EXHAUSTED|quota|rate.?limit|too many requests/i.test(errorMessage)) return undefined;
+	if (/PerDay|requests? per day|RequestsPerDay/i.test(errorMessage)) return nextPacificMidnight(now);
+	if (/per minute|PerMinute/i.test(errorMessage)) return now + 75_000;
+	const retryIn = /retry in ([0-9.]+)\s*s/i.exec(errorMessage);
+	if (retryIn) {
+		return now + Math.min(DECISIONS_MINUTE_MAX_MS, Math.max(5000, Number(retryIn[1]) * 1000 + 3000));
+	}
+	return now + DECISIONS_SUSPECTED_TTL_MS;
+}
+
+/** Classify through Google's Decisions API, rotating keys on failure: the
+ * first failure marks the key and tries the next one; the key that last
+ * answered is sticky (tried first on the next call). Registered as the
+ * classifier implementation of the `google-decisions` provider below. */
+export function googleDecisionsClassifier() {
 	return async (
 		model: { id: string; baseUrl?: string },
 		context: ClassifierContext,
@@ -333,47 +441,82 @@ function googleDecisionsClassifier() {
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
-		try {
-			const apiKey = options?.apiKey || process.env.GEMINI_API_KEY_1;
-			if (!apiKey) throw new Error("no Google API key (set GEMINI_API_KEY_1)");
-			const response = await fetch(`${(model.baseUrl ?? GOOGLE_DECISIONS_BASE_URL).replace(/\/+$/u, "")}/decisions`, {
-				method: "POST",
-				headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-				body: JSON.stringify({
-					model: model.id,
-					input: JSON.stringify(context.state),
-					questions: Object.fromEntries(
-						Object.entries(context.questions).map(([id, question]) => [
-							id,
-							googleWireQuestion(question as { type: string; instructions: string; criteria: unknown }),
-						]),
-					),
-				}),
-				signal: options?.signal,
-			});
-			const body = (await response.json()) as {
-				answers?: Record<string, { type?: string; choice?: string; probabilities?: Record<string, number>; confidence?: number; noul?: number; score?: number }>;
-				error?: { message?: string };
-			};
-			if (!response.ok) throw new Error(body.error?.message ?? `Google Decisions API error ${response.status}`);
-			const answers: ClassifierResult["answers"] = {};
-			for (const [id, answer] of Object.entries(body.answers ?? {})) {
-				if (answer.type === "choice" && typeof answer.choice === "string") {
-					answers[id] = { type: "choice", choice: answer.choice, probabilities: answer.probabilities ?? {}, confidence: answer.confidence ?? 0 };
-				} else if (answer.type === "noul" && typeof answer.noul === "number") {
-					answers[id] = { type: "bool", probability: answer.noul };
-				} else if (answer.type === "score" && typeof answer.score === "number") {
-					answers[id] = { type: "score", score: answer.score, confidence: answer.confidence ?? 0 };
-				}
-			}
-			output.answers = answers;
-			return output;
-		} catch (error) {
-			output.answers = {};
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = String((error as Error)?.message ?? error).slice(0, 200);
+		const url = `${(model.baseUrl ?? GOOGLE_DECISIONS_BASE_URL).replace(/\/+$/u, "")}/decisions`;
+		const keys = decisionsKeys(options?.apiKey);
+		if (keys.length === 0) {
+			output.stopReason = "error";
+			output.errorMessage = "no Google API key (set GEMINI_API_KEY_1 or configure google accounts in multi-account.json)";
 			return output;
 		}
+		const ordered = [...keys];
+		if (decisionsSticky) {
+			const idx = ordered.findIndex((k) => k.value === decisionsSticky);
+			if (idx > 0) ordered.unshift(...ordered.splice(idx, 1));
+		}
+		let lastError = "";
+		let tried = 0;
+		for (const key of ordered) {
+			if (options?.signal?.aborted) {
+				output.stopReason = "aborted";
+				return output;
+			}
+			const deadUntil = decisionsMarks.get(key.label);
+			if (deadUntil && deadUntil > Date.now()) continue;
+			tried += 1;
+			try {
+				const response = await fetch(url, {
+					method: "POST",
+					headers: { "content-type": "application/json", "x-goog-api-key": key.value },
+					body: JSON.stringify({
+						model: model.id,
+						input: JSON.stringify(context.state),
+						questions: Object.fromEntries(
+							Object.entries(context.questions).map(([id, question]) => [
+								id,
+								googleWireQuestion(question as { type: string; instructions: string; criteria: unknown }),
+							]),
+						),
+					}),
+					signal: options?.signal,
+				});
+				const body = (await response.json()) as {
+					answers?: Record<string, { type?: string; choice?: string; probabilities?: Record<string, number>; confidence?: number; noul?: number; score?: number }>;
+					error?: { message?: string };
+				};
+				if (!response.ok) {
+					throw new Error(`${response.status}: ${body.error?.message ?? `Google Decisions API error ${response.status}`}`);
+				}
+				// This key answers: sticky from now on, and any mark against it is stale.
+				decisionsSticky = key.value;
+				decisionsMarks.delete(key.label);
+				const answers: ClassifierResult["answers"] = {};
+				for (const [id, answer] of Object.entries(body.answers ?? {})) {
+					if (answer.type === "choice" && typeof answer.choice === "string") {
+						answers[id] = { type: "choice", choice: answer.choice, probabilities: answer.probabilities ?? {}, confidence: answer.confidence ?? 0 };
+					} else if (answer.type === "noul" && typeof answer.noul === "number") {
+						answers[id] = { type: "bool", probability: answer.noul };
+					} else if (answer.type === "score" && typeof answer.score === "number") {
+						answers[id] = { type: "score", score: answer.score, confidence: answer.confidence ?? 0 };
+					}
+				}
+				output.answers = answers;
+				return output;
+			} catch (error) {
+				lastError = String((error as Error)?.message ?? error);
+				if (options?.signal?.aborted) {
+					output.stopReason = "aborted";
+					return output;
+				}
+				const deadUntil = decisionsDeadUntil(lastError);
+				if (deadUntil) decisionsMarks.set(key.label, deadUntil);
+			}
+		}
+		output.stopReason = "error";
+		output.errorMessage =
+			tried === 0
+				? `gemini-decision-1: all ${ordered.length} key(s) are quota-marked`
+				: `gemini-decision-1 failed on ${tried}/${ordered.length} key(s); last: ${lastError.slice(0, 150)}`;
+		return output;
 	};
 }
 
@@ -455,7 +598,7 @@ export default function (pi: ExtensionAPI): void {
 		const classifier = ctx.modelRegistry.getModelOfType("classifier", split.provider, split.id);
 		if (classifier) {
 			const context: ClassifierContext = {
-				state: payload as unknown as Record<string, unknown>,
+				state: payload as unknown as ClassifierContext["state"],
 				questions: {
 					verdict: {
 						type: "choice",
@@ -647,7 +790,7 @@ export default function (pi: ExtensionAPI): void {
 						ctx.ui.notify?.("usage: /guardrails model <provider/model-id>", "warning");
 						return;
 					}
-					applyConfig(persistConfig({ model: ref }));
+					applyConfig(persistConfig({ model: [ref] }));
 					ctx.ui.notify?.(`guardrails model set to ${ref}`, "info");
 					return;
 				}

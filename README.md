@@ -37,9 +37,15 @@ Configured as pi model refs, tried in order; the first usable answer wins.
   - **Google AI Studio** (`google-decisions/gemini-decision-1`, default):
     this extension registers Google's Decisions API
     (`POST /v1beta/decisions`, map-shaped questions, `noul` bools,
-    `x-goog-api-key` auth) as a classifier provider; the key comes from
-    `$GEMINI_API_KEY_1`. Generous free quota, ~200ms per verdict,
-    calibrated confidences.
+    `x-goog-api-key` auth) as a classifier provider. **Multi-key ring**: the
+    pi-resolved key first, then every google account in
+    `multi-account.json`, then a `GEMINI_API_KEY_N` env scan. The key that
+    last answered is sticky; on failure the next key is tried — a per-day
+    quota 429 marks the key dead until midnight Pacific, a per-minute hit
+    cools it by Google's retry hint (≤120s), an ambiguous quota 429 marks it
+    "possibly RPD" for 30 minutes, and an invalid key (401/403) is out for
+    the day. Marks are in-memory; success clears them. Generous free quota
+    across 8 keys, ~200ms per verdict, calibrated confidences.
   - **llama.cpp** (`llama.cpp/d3-lite`): local decision models through the
     `llama-cpp-classify` fallback (label-token logprobs; d3-lite served by
     the PrismML fork on a dedicated llama-server).
