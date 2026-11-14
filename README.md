@@ -48,15 +48,29 @@ Configured as pi model refs, tried in order; the first usable answer wins.
     across 8 keys, ~200ms per verdict, calibrated confidences.
   - **llama.cpp** (`llama.cpp/d3-lite`): local decision models through the
     `llama-cpp-classify` fallback (label-token logprobs; d3-lite served by
-    the PrismML fork on a dedicated llama-server).
+    the PrismML fork on a dedicated llama-server, started on demand — see
+    below).
   - **SystemOne** (`openrouter/~liquid/d1-*` at `/api/v1/systemone`):
     answers natively, needs credit.
 - **chat models** (e.g. openrouter `:free`) go through
   `modelRegistry.complete()` with a strict JSON verdict protocol.
 
-Default: `google-decisions/gemini-decision-1`, then local
-`llama.cpp/d3-lite`, then `openrouter/nvidia/nemotron-3.5-lightning:free`,
-then `openrouter/nvidia/nemotron-3.5-super-vl:free`.
+Default: `google-decisions/gemini-decision-1`, then
+`openrouter/nvidia/nemotron-3.5-lightning:free`, then the lazy local
+`llama.cpp/d3-lite`, then `openrouter/nvidia/nemotron-3.5-super-vl:free`.
+
+## The lazy local fallback
+
+`llama.cpp/d3-lite` runs as a systemd *user* unit (`d3-lite.service`) that is
+**disabled**: no model sits in RAM while the cloud models are healthy. Only
+when the chain reaches the local ref — every cloud model ahead of it has
+failed — does the extension start the unit, wait for llama-server's
+`/health` (up to 90 s), and call it with a 30 s timeout (a cold start needs
+more headroom than the normal 8 s). It goes back down on its own: after
+~10 minutes without a verdict, or when the pi session shuts down — but only
+if that session started it; a unit running on purpose (user or another
+session) is never touched. A failed start, or one that never turns healthy,
+is dead-marked for 15 minutes while the chain continues fail-open.
 
 ## Configuration
 
@@ -65,7 +79,7 @@ then `openrouter/nvidia/nemotron-3.5-super-vl:free`.
 ```json
 {
   "enabled": true,
-  "model": ["google-decisions/gemini-decision-1", "llama.cpp/d3-lite", "openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/nvidia/nemotron-3.5-super-vl:free"],
+  "model": ["google-decisions/gemini-decision-1", "openrouter/nvidia/nemotron-3.5-lightning:free", "llama.cpp/d3-lite", "openrouter/nvidia/nemotron-3.5-super-vl:free"],
   "scope": ["bash", "write", "edit"],
   "failMode": "open",
   "timeoutMs": 8000,

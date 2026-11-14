@@ -31,6 +31,12 @@
  *   with a strict JSON verdict protocol.
  * Refs are tried in configured order; the first usable answer wins.
  *
+ * The local llama.cpp fallback (`llama.cpp/d3-lite`) is lazy: its systemd
+ * user unit is disabled, so nothing sits in RAM waiting for cloud models to
+ * fail. When the chain reaches it, the guard starts the unit, waits for
+ * llama-server's /health, and stops it again after ~10 idle minutes or at
+ * session end — but only if this process started it.
+ *
  * The bash fast-path skips the model entirely for strictly read-only commands
  * (ls, cat, rg, git status, ...). This is not just latency: keeping the model
  * out of harmless calls concentrates its attention on the ones that could be
@@ -40,6 +46,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import { execFile } from "node:child_process";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -86,10 +93,12 @@ const GOOGLE_DECISIONS_API: ClassifierApi = "google-decisions";
 
 const DEFAULTS: GuardrailsConfig = {
 	enabled: true,
+	// The local d3-lite fallback sits behind both cloud models and is started
+	// on demand only when they have both failed (see d3LiteRuntime below).
 	model: [
 		"google-decisions/gemini-decision-1",
-		"llama.cpp/d3-lite",
 		"openrouter/nvidia/nemotron-3.5-lightning:free",
+		"llama.cpp/d3-lite",
 		"openrouter/nvidia/nemotron-3.5-super-vl:free",
 	],
 	scope: ["bash", "write", "edit"],
@@ -520,6 +529,145 @@ export function googleDecisionsClassifier() {
 	};
 }
 
+/* The local fallback (`llama.cpp/d3-lite`) is a systemd user unit that is
+ * deliberately DISABLED — a 1.4G model must not sit in RAM while the cloud
+ * decision models are healthy. The guard starts it on demand (only when the
+ * refs ahead of it in the chain have failed), waits for llama-server's
+ * /health, and puts it back down after an idle window or at session shutdown
+ * — but only a unit this process started, never one the user (or another pi
+ * session) is running on purpose. A start that fails or never turns healthy
+ * marks the model dead for a while, so the next guarded call does not burn
+ * seconds on systemctl again. */
+
+const D3_LITE_MODEL_ID = "d3-lite";
+const D3_LITE_SERVICE = "d3-lite.service";
+const D3_LITE_HEALTH_URL = "http://127.0.0.1:11199/health";
+const D3_LITE_START_TIMEOUT_MS = 90_000;
+const D3_LITE_PROBE_INTERVAL_MS = 500;
+const D3_LITE_PROBE_TIMEOUT_MS = 1_500;
+const D3_LITE_DEAD_TTL_MS = 15 * 60 * 1000;
+const D3_LITE_IDLE_STOP_MS = 10 * 60 * 1000;
+/** Cold start (unit + weight load) happens outside the decision timeout, but
+ * the call itself gets more headroom than a cloud model needs. */
+const D3_LITE_CALL_TIMEOUT_MS = 30_000;
+
+type D3LiteDeps = {
+	/** True when llama-server answers /health with a 2xx. */
+	probe?: () => Promise<boolean>;
+	/** True when the systemd unit is active or activating. */
+	isActive?: () => Promise<boolean>;
+	start?: () => Promise<void>;
+	stop?: () => Promise<void>;
+	sleep?: (ms: number) => Promise<void>;
+	now?: () => number;
+};
+
+function systemctlUser(args: string[], tolerateFailure = false): Promise<void> {
+	return new Promise((resolve, reject) => {
+		execFile("systemctl", ["--user", ...args], (error) => {
+			if (error && !tolerateFailure) reject(error);
+			else resolve();
+		});
+	});
+}
+
+/** Lifecycle owner for the local d3-lite fallback. All methods never throw
+ * and are safe to call any number of times. */
+export function d3LiteRuntime(deps: D3LiteDeps = {}) {
+	const now = deps.now ?? Date.now;
+	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+	const isActive = deps.isActive ?? (() => systemctlUser(["is-active", D3_LITE_SERVICE], true).then(() => true, () => false));
+	const start = deps.start ?? (() => systemctlUser(["start", D3_LITE_SERVICE]));
+	const stop = deps.stop ?? (() => systemctlUser(["stop", D3_LITE_SERVICE], true));
+	const probe = deps.probe ?? (async () => {
+		try {
+			return (await fetch(D3_LITE_HEALTH_URL, { signal: AbortSignal.timeout(D3_LITE_PROBE_TIMEOUT_MS) })).ok;
+		} catch {
+			return false;
+		}
+	});
+
+	/** Epoch ms until which start attempts are skipped. */
+	let deadUntil = 0;
+	/** True only while a unit THIS process started is up. */
+	let startedByUs = false;
+	let lastUsedAt = 0;
+	let idleTimer: NodeJS.Timeout | undefined;
+
+	function armIdleStop(): void {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = setTimeout(() => {
+			idleTimer = undefined;
+			void maybeIdleStop();
+		}, D3_LITE_IDLE_STOP_MS);
+		idleTimer.unref?.();
+	}
+
+	async function shutdown(): Promise<void> {
+		startedByUs = false;
+		if (idleTimer) {
+			clearTimeout(idleTimer);
+			idleTimer = undefined;
+		}
+		await stop();
+	}
+
+	/** The idle window elapsed without a use: stop the unit we started. */
+	async function maybeIdleStop(): Promise<void> {
+		if (!startedByUs) return;
+		if (now() - lastUsedAt < D3_LITE_IDLE_STOP_MS) {
+			armIdleStop();
+			return;
+		}
+		await shutdown();
+	}
+
+	/** Bring the local fallback up. False = unusable right now. */
+	async function ensureUp(): Promise<boolean> {
+		if (await probe()) return true;
+		if (now() < deadUntil) return false;
+		if (!(await isActive())) {
+			try {
+				await start();
+			} catch {
+				deadUntil = now() + D3_LITE_DEAD_TTL_MS;
+				return false;
+			}
+			startedByUs = true;
+		}
+		const deadline = now() + D3_LITE_START_TIMEOUT_MS;
+		while (now() < deadline) {
+			if (await probe()) {
+				if (startedByUs) {
+					lastUsedAt = now();
+					armIdleStop();
+				}
+				return true;
+			}
+			await sleep(D3_LITE_PROBE_INTERVAL_MS);
+		}
+		// Never turned healthy: skip for a while — and if we started it, do not
+		// leave a dead unit looping behind Restart=always.
+		deadUntil = now() + D3_LITE_DEAD_TTL_MS;
+		if (startedByUs) await shutdown();
+		return false;
+	}
+
+	/** A verdict came from d3-lite: keep the idle window open. */
+	function noteUsed(): void {
+		if (!startedByUs) return;
+		lastUsedAt = now();
+		armIdleStop();
+	}
+
+	/** Session is over: put the unit down if this process started it. */
+	function stopIfOurs(): Promise<void> {
+		return startedByUs ? shutdown() : Promise.resolve();
+	}
+
+	return { ensureUp, noteUsed, stopIfOurs, maybeIdleStop };
+}
+
 function splitRef(ref: string): { provider: string; id: string } | null {
 	const slash = ref.indexOf("/");
 	if (slash <= 0 || slash === ref.length - 1) return null;
@@ -554,6 +702,7 @@ export default function (pi: ExtensionAPI): void {
 	let neverBlock: RegExp[] = compileRegexes(config.neverBlock);
 	const cache = new Map<string, { verdict: Verdict; expires: number }>();
 	let notifiedFailover = false;
+	const d3 = d3LiteRuntime();
 
 	function applyConfig(next: GuardrailsConfig) {
 		config = next;
@@ -594,7 +743,10 @@ export default function (pi: ExtensionAPI): void {
 	async function decideWith(ref: string, payload: { tool: string; cwd: string; action: string }, ctx: ExtensionContext): Promise<Verdict | null> {
 		const split = splitRef(ref);
 		if (!split) return null;
-		const signal = AbortSignal.timeout(config.timeoutMs);
+		// The local fallback may be loading its weights on the first call of a
+		// cold start; give it more headroom than a cloud model needs.
+		const timeoutMs = split.id === D3_LITE_MODEL_ID ? Math.max(config.timeoutMs, D3_LITE_CALL_TIMEOUT_MS) : config.timeoutMs;
+		const signal = AbortSignal.timeout(timeoutMs);
 		const classifier = ctx.modelRegistry.getModelOfType("classifier", split.provider, split.id);
 		if (classifier) {
 			const context: ClassifierContext = {
@@ -653,10 +805,21 @@ export default function (pi: ExtensionAPI): void {
 			const t0 = Date.now();
 			const split = splitRef(ref);
 			const decisionPath = split && ctx.modelRegistry.getModelOfType("classifier", split.provider, split.id) ? "classifier" : "chat";
+			// The local fallback runs as an on-demand systemd unit: bring it up
+			// (and only now), or skip it — the chain continues, fail-open as ever.
+			if (split?.id === D3_LITE_MODEL_ID && !(await d3.ensureUp())) {
+				log({
+					ts: new Date().toISOString(), tool: payload.tool, model: ref, path: "chat", mode: "error",
+					verdict: "allow", category: "error", reason: "local d3-lite unavailable (start failed or dead-marked)",
+					latencyMs: Date.now() - t0, input: payload.action.slice(0, 200),
+				});
+				continue;
+			}
 			try {
 				const verdict = await decideWith(ref, payload, ctx);
 				if (verdict) {
 					verdict.model = ref;
+					if (split?.id === D3_LITE_MODEL_ID) d3.noteUsed();
 					return { verdict, model: ref, decisionPath, mode: "model" };
 				}
 			} catch (error) {
@@ -823,5 +986,11 @@ export default function (pi: ExtensionAPI): void {
 		applyConfig(loadConfig());
 		notifiedFailover = false;
 		ctx.ui.setStatus?.("guardrails", config.enabled ? `guard:${shortModelRef(config.model[0] ?? "")}` : undefined);
+	});
+
+	// Leave no local model behind: if this session started the d3-lite unit,
+	// stop it when the session shuts down.
+	pi.on("session_shutdown", async () => {
+		await d3.stopIfOurs();
 	});
 }
